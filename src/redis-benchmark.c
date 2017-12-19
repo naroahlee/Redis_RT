@@ -49,6 +49,25 @@
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
 
+/*
+ * Read the rdtsc value: RDTSCP
+ */
+#if defined(__i386__)
+static __inline__ unsigned long long rdtsc(void)
+{
+	unsigned long long int x;
+	__asm__ volatile (".byte 0x0f, 0x31" : "=A" (x));
+	return x;
+}
+#elif defined(__x86_64__)
+static __inline__ unsigned long long rdtsc(void)
+{
+	unsigned hi, lo;
+	__asm__ __volatile__ ("rdtscp" : "=a"(lo), "=d"(hi));
+	return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
+}
+#endif
+
 static struct config {
     aeEventLoop *el;
     const char *hostip;
@@ -66,9 +85,10 @@ static struct config {
     int keepalive;
     int pipeline;
     int showerrors;
-    long long start;
-    long long totlatency;
-    long long *latency;
+/* NAROAH 171218 long long ==> unsigned long long */
+    unsigned long long start;
+    unsigned long long totlatency;
+    unsigned long long *latency;
     const char *title;
     list *clients;
     int quiet;
@@ -88,8 +108,9 @@ typedef struct _client {
     size_t randlen;         /* Number of pointers in client->randptr */
     size_t randfree;        /* Number of unused pointers in client->randptr */
     size_t written;         /* Bytes of 'obuf' already written */
-    long long start;        /* Start time of a request */
-    long long latency;      /* Request latency */
+/* NAROAH 171218 long long ==> unsigned long long */
+    unsigned long long start;        /* Start time of a request */
+    unsigned long long latency;      /* Request latency */
     int pending;            /* Number of pending requests (replies to consume) */
     int prefix_pending;     /* If non-zero, number of pending prefix commands. Commands
                                such as auth and select are prefixed to the pipeline of
@@ -97,30 +118,39 @@ typedef struct _client {
     int prefixlen;          /* Size in bytes of the pending prefix commands */
 } *client;
 
+/* Global Fxn Pointers */
+/* NAROAH 171218 Add fxn pointer */
+static unsigned long long (*gfustime)(void);
+static unsigned long long (*gfmstime)(void);
+static void (*gfshowLatencyReport)(void);
+
 /* Prototypes */
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void createMissingClients(client c);
 
+
+
 /* Implementation */
-static long long ustime(void) {
+static unsigned long long ustime(void) {
     struct timeval tv;
-    long long ust;
+    unsigned long long ust;
 
     gettimeofday(&tv, NULL);
-    ust = ((long)tv.tv_sec)*1000000;
+    ust = ((unsigned long)tv.tv_sec)*1000000;
     ust += tv.tv_usec;
     return ust;
 }
 
-static long long mstime(void) {
+static unsigned long long mstime(void) {
     struct timeval tv;
-    long long mst;
+    unsigned long long mst;
 
     gettimeofday(&tv, NULL);
-    mst = ((long long)tv.tv_sec)*1000;
+    mst = ((unsigned long long)tv.tv_sec)*1000;
     mst += tv.tv_usec/1000;
     return mst;
 }
+
 
 static void freeClient(client c) {
     listNode *ln;
@@ -196,7 +226,10 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Calculate latency only for the first read event. This means that the
      * server already sent the reply and we need to parse it. Parsing overhead
      * is not part of the latency, so calculate it only once, here. */
-    if (c->latency < 0) c->latency = ustime()-(c->start);
+    /* if (c->latency < 0) c->latency = ustime()-(c->start); */
+    if (c->latency == 0) {
+		c->latency = (*gfustime)()-(c->start);
+	}
 
     if (redisBufferRead(c->context) != REDIS_OK) {
         fprintf(stderr,"Error: %s\n",c->context->errstr);
@@ -271,8 +304,14 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
         /* Really initialize: randomize keys and set start time. */
         if (config.randomkeys) randomizeClientKey(c);
-        c->start = ustime();
-        c->latency = -1;
+		
+		/* NAROAH 171218: gfustime() */
+        /* c->start = ustime(); */
+		c->start = (*gfustime)();
+
+		/* NAROAH 171218: -1 ==> 0 due to unsigned */
+        /* c->latency = -1; */
+        c->latency = 0;
     }
 
     if (sdslen(c->obuf) > c->written) {
@@ -433,6 +472,7 @@ static void showLatencyReport(void) {
     float perc, reqpersec;
 
     reqpersec = (float)config.requests_finished/((float)config.totlatency/1000);
+    printf("%.2f requests per second\n\n", reqpersec);
     if (!config.quiet && !config.csv) {
         printf("====== %s ======\n", config.title);
         printf("  %d requests completed in %.2f seconds\n", config.requests_finished,
@@ -444,19 +484,50 @@ static void showLatencyReport(void) {
 
         qsort(config.latency,config.requests,sizeof(long long),compareLatency);
         for (i = 0; i < config.requests; i++) {
-            if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
+            if ((long long)config.latency[i]/1000 != curlat || i == (config.requests-1)) {
                 curlat = config.latency[i]/1000;
                 perc = ((float)(i+1)*100)/config.requests;
                 printf("%.2f%% <= %d milliseconds\n", perc, curlat);
             }
         }
-        printf("%.2f requests per second\n\n", reqpersec);
     } else if (config.csv) {
         printf("\"%s\",\"%.2f\"\n", config.title, reqpersec);
     } else {
         printf("%s: %.2f requests per second\n", config.title, reqpersec);
     }
 }
+
+/* NAROAH 171218: RDTSC Cycles */
+static void showLatencyCycles(void) {
+
+	FILE *fp;
+    float cycperreq;
+	int i;
+
+	fp = fopen("res.csv", "w");
+
+    cycperreq = ((float)config.totlatency) / (float)config.requests_finished;
+
+    if (!config.quiet && !config.csv) {
+        printf("====== %s ======\n", config.title);
+		printf("  %d requests completed in %llu cycles\n", 
+				config.requests_finished, 
+				config.totlatency);
+		printf("  %.2f cycles per request\n\n", cycperreq);
+        printf("  %d parallel clients\n", config.numclients);
+        printf("  %d bytes payload\n", config.datasize);
+        printf("  keep alive: %d\n", config.keepalive);
+        printf("\n");
+
+        qsort(config.latency,config.requests,sizeof(long long),compareLatency);
+        for (i = 0; i < config.requests; i++) {
+			fprintf(fp, "%llu\n", config.latency[i]);
+        }
+    }
+	fclose(fp);
+	return;
+}
+
 
 static void benchmark(char *title, char *cmd, int len) {
     client c;
@@ -468,11 +539,13 @@ static void benchmark(char *title, char *cmd, int len) {
     c = createClient(cmd,len,NULL);
     createMissingClients(c);
 
-    config.start = mstime();
+    /* config.start = mstime(); */
+    config.start = (*gfmstime)();
     aeMain(config.el);
-    config.totlatency = mstime()-config.start;
+    /* config.totlatency = mstime()-config.start; */
+    config.totlatency = (*gfmstime)()-config.start;
 
-    showLatencyReport();
+    gfshowLatencyReport();
     freeAllClients();
 }
 
@@ -624,7 +697,8 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
         fflush(stdout);
 	return 250;
     }
-    float dt = (float)(mstime()-config.start)/1000.0;
+	/* NAROAH 171218 gfmstime */
+    float dt = (float)((*gfmstime)()-config.start)/1000.0;
     float rps = (float)config.requests_finished/dt;
     printf("%s: %.2f\r", config.title, rps);
     fflush(stdout);
@@ -643,6 +717,15 @@ int test_is_selected(char *name) {
     buf[l+1] = ',';
     buf[l+2] = '\0';
     return strstr(config.tests,buf) != NULL;
+}
+
+
+/* NAROAH 171218 Add fxn pointer */
+static void init_fxn(void)
+{
+	gfustime = &rdtsc;
+	gfmstime = &rdtsc;
+	gfshowLatencyReport = &showLatencyCycles;
 }
 
 int main(int argc, const char **argv) {
@@ -684,7 +767,13 @@ int main(int argc, const char **argv) {
     argc -= i;
     argv += i;
 
-    config.latency = zmalloc(sizeof(long long)*config.requests);
+	init_fxn();
+
+	/* NAROAH 171218 unsigned long long */
+    config.latency = zmalloc(sizeof(unsigned long long)*config.requests);
+
+	/* NAROAH 171218 Test Print */
+	printf("This is NAROAH.\n");
 
     if (config.keepalive == 0) {
         printf("WARNING: keepalive disabled, you probably need 'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse' for Linux and 'sudo sysctl -w net.inet.tcp.msl=1000' for Mac OS X in order to use a lot of clients/requests\n");
